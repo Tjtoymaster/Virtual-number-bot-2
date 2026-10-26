@@ -1,0 +1,439 @@
+const { Markup } = require('telegraf');
+const config = require('../config');
+const database = require('../database/database');
+const dssmshub = require('../services/dssmshub');
+const orderService = require('../services/orderService');
+const { getState, setState, clearState } = require('../utils/state');
+const { providerPriceToKobo, applyMargin } = require('../utils/money');
+const { escapeHtml, formatMoney, shortId, formatOrderStatus } = require('../utils/format');
+const { chunk, editOrReply } = require('../utils/helpers');
+const { backMenuMarkup } = require('../utils/keyboards');
+
+const PAGE_SIZE = 8;
+
+const isAdmin = (ctx) => {
+  const id = String(ctx.from?.id);
+  if (Array.isArray(config.admin?.ids) && config.admin.ids.length) {
+    return config.admin.ids.includes(id);
+  }
+  return Boolean(config.admin?.id) && id === String(config.admin.id);
+};
+
+async function replyHtml(ctx, text, markup) {
+  await ctx.reply(text, { parse_mode: 'HTML', ...(markup || {}) });
+}
+
+function defaultServer() {
+  return config.dssmshub.defaultServer || null;
+}
+
+function countryPaginationRow(serverId, page, pageCount) {
+  const row = [];
+  if (page > 0) row.push(Markup.button.callback('⬅️ Prev', `cntpg:${serverId}:${page - 1}`));
+  row.push(Markup.button.callback(`${page + 1}/${pageCount}`, 'noop'));
+  if (page < pageCount - 1) row.push(Markup.button.callback('Next ➡️', `cntpg:${serverId}:${page + 1}`));
+  return row;
+}
+
+function servicePaginationRow(serverId, countryCode, page, pageCount) {
+  const row = [];
+  if (page > 0) row.push(Markup.button.callback('⬅️ Prev', `svcp:${serverId}:${countryCode}:${page - 1}`));
+  row.push(Markup.button.callback(`${page + 1}/${pageCount}`, 'noop'));
+  if (page < pageCount - 1)
+    row.push(Markup.button.callback('Next ➡️', `svcp:${serverId}:${countryCode}:${page + 1}`));
+  return row;
+}
+
+async function entryCountries(ctx) {
+  const server = defaultServer();
+  if (server) return renderCountries(ctx, server, 0);
+  return renderServers(ctx);
+}
+
+async function renderServers(ctx) {
+  const servers = await dssmshub.getServers();
+
+  if (!servers.length) {
+    await editOrReply(ctx, 'No servers are currently available.', backMenuMarkup());
+    return;
+  }
+
+  const buttons = servers.map(server => [
+    Markup.button.callback(
+      server.description ? `${server.name} — ${server.description}` : server.name,
+      `srv:${server.id}`
+    )
+  ]);
+
+  buttons.push([Markup.button.callback('🔙 Back to Menu', 'menu')]);
+
+  await editOrReply(
+    ctx,
+    '🖥️ <b>Select a server</b>\n\nServers 1/3/5: USA\nServers 2/4/6: Global & USA',
+    Markup.inlineKeyboard(buttons)
+  );
+}
+
+async function renderCountries(ctx, serverId, page = 0) {
+  const countries = await dssmshub.getCountries(serverId);
+
+  if (!countries.length) {
+    await editOrReply(ctx, 'No countries available on this server.', backMenuMarkup());
+    return;
+  }
+
+  const pages = chunk(countries, PAGE_SIZE);
+  const safePage = Math.min(Math.max(page, 0), pages.length - 1);
+
+  const buttons = pages[safePage].map(country => [
+    Markup.button.callback(country.name, `cnt:${serverId}:${country.code}`)
+  ]);
+
+  if (pages.length > 1) {
+    buttons.push(countryPaginationRow(serverId, safePage, pages.length));
+  }
+
+  if (!defaultServer()) {
+    buttons.push([Markup.button.callback('🖥️ Change Server', 'buy_number')]);
+  }
+
+  await editOrReply(
+    ctx,
+    `🌍 <b>Select a country</b> (Server ${serverId})\nPage ${safePage + 1}/${pages.length}`,
+    Markup.inlineKeyboard(buttons)
+  );
+}
+
+async function renderServices(ctx, serverId, countryCode, page = 0) {
+  const countries = await dssmshub.getCountries(serverId);
+  const country = countries.find(item => item.code === countryCode);
+
+  const services = await dssmshub.getServices(serverId, countryCode);
+
+  if (!services.length) {
+    await editOrReply(
+      ctx,
+      `No services available for ${escapeHtml(country?.name || countryCode)}.`,
+      backMenuMarkup('🔙 Back to Countries')
+    );
+    return;
+  }
+
+  const pages = chunk(services, PAGE_SIZE);
+  const safePage = Math.min(Math.max(page, 0), pages.length - 1);
+
+  const buttons = pages[safePage].map((service, index) => {
+    const globalIndex = safePage * PAGE_SIZE + index;
+    return [
+      Markup.button.callback(service.name.slice(0, 60), `svc:${serverId}:${countryCode}:${globalIndex}`)
+    ];
+  });
+
+  if (pages.length > 1) {
+    buttons.push(servicePaginationRow(serverId, countryCode, safePage, pages.length));
+  }
+
+  buttons.push([Markup.button.callback('🌍 Back to Countries', `cntlist:${serverId}`)]);
+
+  await editOrReply(
+    ctx,
+    `${escapeHtml(country?.name || countryCode)} — Server ${serverId}\n\n<b>Select a service:</b>\nPage ${safePage + 1}/${pages.length}`,
+    Markup.inlineKeyboard(buttons)
+  );
+}
+
+async function showServiceDetails(ctx, serverId, countryCode, serviceIndex) {
+  const services = await dssmshub.getServices(serverId, countryCode);
+  const service = services[serviceIndex];
+
+  if (!service) {
+    await editOrReply(ctx, 'Service no longer available. Please select again.', backMenuMarkup());
+    return;
+  }
+
+  const countries = await dssmshub.getCountries(serverId);
+  const country = countries.find(item => item.code === countryCode) || {
+    code: countryCode,
+    name: countryCode
+  };
+
+  let price = null;
+  let priceError = null;
+  let chargeKobo = null;
+
+  try {
+    price = await dssmshub.getPrice(serverId, service.id, countryCode);
+    chargeKobo = applyMargin(providerPriceToKobo(price.price, price.currency));
+  } catch (err) {
+    priceError = err.message;
+  }
+
+  setState(ctx.from.id, 'confirm_purchase', {
+    serverId,
+    countryCode,
+    serviceId: service.id,
+    serviceName: service.name
+  });
+
+  const user = database.getUser(ctx.from.id);
+
+  const text = [
+    '🛒 <b>Confirm Purchase</b>',
+    '',
+    `<b>Server:</b> Server ${serverId}`,
+    `<b>Country:</b> ${escapeHtml(country.name)}`,
+    `<b>Service:</b> ${escapeHtml(service.name)}`,
+    priceError
+      ? `<b>Price Error:</b> ${escapeHtml(priceError)}`
+      : `<b>Price:</b> ${formatMoney(chargeKobo)} <i>(includes service fee)</i>`,
+    `<b>Your Balance:</b> ${formatMoney(user.balance)}`,
+    '',
+    priceError ? 'Pricing unavailable right now. Try again shortly.' : 'Choose a payment method.'
+  ].join('\n');
+
+  const buttons = [];
+
+  if (!priceError && chargeKobo > 0) {
+    if (user.balance >= chargeKobo) {
+      buttons.push([
+        Markup.button.callback(`💰 Pay with Balance (${formatMoney(chargeKobo)})`, 'confirm_balance')
+      ]);
+    }
+
+    buttons.push([Markup.button.callback('💳 Pay with Paystack', 'confirm_paystack')]);
+  }
+
+  buttons.push([Markup.button.callback('🔙 Back to Services', `svcp:${serverId}:${countryCode}:0`)]);
+
+  await editOrReply(ctx, text, Markup.inlineKeyboard(buttons));
+}
+
+async function buildOrderFromState(ctx) {
+  const state = getState(ctx.from.id);
+
+  if (!state || state.type !== 'confirm_purchase') {
+    throw new Error('Selection expired. Please choose a service again.');
+  }
+
+  const { serverId, countryCode, serviceId, serviceName } = state.data;
+
+  const countries = await dssmshub.getCountries(serverId);
+  const country = countries.find(item => item.code === countryCode) || {
+    code: countryCode,
+    name: countryCode
+  };
+
+  const price = await dssmshub.getPrice(serverId, serviceId, countryCode);
+  const providerCostKobo = providerPriceToKobo(price.price, price.currency);
+  const chargeKobo = applyMargin(providerCostKobo);
+
+  return orderService.createNumberOrder({
+    userId: ctx.from.id,
+    serverId,
+    country,
+    service: { id: serviceId, name: serviceName },
+    chargeKobo,
+    providerCostKobo
+  });
+}
+
+async function handleVerifyResult(ctx, orderId) {
+  const existing = database.getOrder(orderId);
+  if (!existing || (existing.userId !== String(ctx.from.id) && !isAdmin(ctx))) {
+    await ctx.reply('Order not found.');
+    return;
+  }
+
+  const res = await orderService.manualVerifyOrder(orderId);
+
+  if (!res.ok) {
+    await ctx.reply(
+      `❌ ${res.reason === 'api_error' ? `Could not check payment: ${escapeHtml(res.message || 'API error')}` : 'Could not check this order.'}`
+    );
+    return;
+  }
+
+  if (res.already) {
+    await replyHtml(
+      ctx,
+      `Order <code>${shortId(res.order.id)}</code> is already <b>${formatOrderStatus(res.order.status)}</b>.`
+    );
+    return;
+  }
+
+  if (res.verified === 'success') {
+    await replyHtml(
+      ctx,
+      `✅ Payment confirmed!\n\nOrder <code>${shortId(res.order.id)}</code> status: <b>${formatOrderStatus(res.order.status)}</b>\n\nOpen My Orders to see the number and OTP.`
+    );
+    return;
+  }
+
+  if (res.verified === 'failed') {
+    await replyHtml(
+      ctx,
+      `❌ Paystack reports this payment as failed or abandoned.\n\nOrder <code>${shortId(res.order.id)}</code> was closed.`
+    );
+    return;
+  }
+
+  await replyHtml(
+    ctx,
+    `⏳ Paystack still shows this payment as pending.\n\nIf you already paid, wait ~30 seconds and tap "I have Paid" again.`
+  );
+}
+
+async function afterPurchaseReply(ctx, order) {
+  const text = [
+    '🧾 <b>Order Created</b>',
+    '',
+    `<b>Order ID:</b> <code>${shortId(order.id)}</code>`,
+    `<b>Status:</b> ${formatOrderStatus(order.status)}`,
+    `<b>Amount:</b> ${formatMoney(order.amountKobo, order.currency)}`,
+    `<b>Service:</b> ${escapeHtml(order.service?.name || 'N/A')}`
+  ].join('\n');
+
+  await ctx.reply(text, {
+    parse_mode: 'HTML',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('View Order', `view_order:${order.id}`)],
+      [Markup.button.callback('📦 My Orders', 'my_orders')]
+    ])
+  });
+}
+
+function registerPurchaseHandlers(bot) {
+  bot.action('buy_number', async ctx => {
+    await ctx.answerCbQuery().catch(() => {});
+    await entryCountries(ctx);
+  });
+
+  bot.action('countries', async ctx => {
+    await ctx.answerCbQuery().catch(() => {});
+    await entryCountries(ctx);
+  });
+
+  bot.command('countries', async ctx => {
+    await entryCountries(ctx);
+  });
+
+  bot.action(/^srv:(\d+)$/, async ctx => {
+    await ctx.answerCbQuery().catch(() => {});
+    await renderCountries(ctx, Number(ctx.match[1]), 0);
+  });
+
+  bot.action(/^cntlist:(\d+)$/, async ctx => {
+    await ctx.answerCbQuery().catch(() => {});
+    await renderCountries(ctx, Number(ctx.match[1]), 0);
+  });
+
+  bot.action(/^cntpg:(\d+):(\d+)$/, async ctx => {
+    await ctx.answerCbQuery().catch(() => {});
+    await renderCountries(ctx, Number(ctx.match[1]), Number(ctx.match[2]));
+  });
+
+  bot.action(/^cnt:(\d+):([^:]+)$/, async ctx => {
+    await ctx.answerCbQuery().catch(() => {});
+    await renderServices(ctx, Number(ctx.match[1]), ctx.match[2], 0);
+  });
+
+  bot.action(/^svcp:(\d+):([^:]+):(\d+)$/, async ctx => {
+    await ctx.answerCbQuery().catch(() => {});
+    await renderServices(ctx, Number(ctx.match[1]), ctx.match[2], Number(ctx.match[3]));
+  });
+
+  bot.action(/^svc:(\d+):([^:]+):(\d+)$/, async ctx => {
+    await ctx.answerCbQuery().catch(() => {});
+    await showServiceDetails(ctx, Number(ctx.match[1]), ctx.match[2], Number(ctx.match[3]));
+  });
+
+  bot.action('confirm_balance', async ctx => {
+    await ctx.answerCbQuery('Processing...').catch(() => {});
+
+    try {
+      const order = await buildOrderFromState(ctx);
+      clearState(ctx.from.id);
+      const updated = await orderService.payOrderWithBalance(order.id);
+      await afterPurchaseReply(ctx, updated);
+    } catch (err) {
+      await ctx.reply(`❌ ${escapeHtml(err.message)}`, backMenuMarkup());
+    }
+  });
+
+  bot.action('confirm_paystack', async ctx => {
+    await ctx.answerCbQuery('Preparing payment...').catch(() => {});
+
+    let order = null;
+
+    try {
+      order = await buildOrderFromState(ctx);
+      clearState(ctx.from.id);
+
+      let checkoutUrl = null;
+      let paystackError = null;
+      try {
+        checkoutUrl = await orderService.initializePaystackPaymentForOrder(order, ctx);
+      } catch (err) {
+        paystackError = err.message;
+      }
+
+      const text = [
+        '💳 <b>Pay for Virtual Number</b>',
+        '',
+        `<b>Order ID:</b> <code>${shortId(order.id)}</code>`,
+        `<b>Service:</b> ${escapeHtml(order.service?.name || 'N/A')}`,
+        `<b>Amount:</b> ${formatMoney(order.amountKobo, order.currency)}`,
+        paystackError ? `\n⚠️ Paystack Error: ${escapeHtml(paystackError)}` : '',
+        '',
+        'Pay using the button, then tap "I have Paid" to confirm instantly.'
+      ].join('\n');
+
+      const buttons = [];
+      if (checkoutUrl) buttons.push([Markup.button.url('💳 Pay with Paystack', checkoutUrl)]);
+      buttons.push([Markup.button.callback('✅ I have Paid – Verify', `verify_num:${order.id}`)]);
+      if (isAdmin(ctx)) buttons.push([Markup.button.callback('🛠️ [DEV] Simulate Success', `mock_num:${order.id}`)]);
+      buttons.push([Markup.button.callback('📦 My Orders', 'my_orders')]);
+
+      await ctx.reply(text, {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard(buttons)
+      });
+    } catch (err) {
+      const buttons = [];
+      if (order) buttons.push([Markup.button.callback('✅ I have Paid – Verify', `verify_num:${order.id}`)]);
+      buttons.push([Markup.button.callback('📦 My Orders', 'my_orders')]);
+
+      await ctx.reply(`❌ ${escapeHtml(err.message)}`, {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard(buttons)
+      });
+    }
+  });
+
+  bot.action(/^verify_num:(.+)$/, async ctx => {
+    await ctx.answerCbQuery('Checking with Paystack...').catch(() => {});
+    await handleVerifyResult(ctx, ctx.match[1]);
+  });
+
+  bot.action(/^mock_num:(.+)$/, async ctx => {
+    if (!isAdmin(ctx)) {
+      return ctx.answerCbQuery('⛔ Admin only.', { show_alert: true });
+    }
+    await ctx.answerCbQuery('Simulating payment...').catch(() => {});
+    try {
+      await orderService.mockPayOrder(ctx.match[1]);
+      await ctx.reply('✅ [DEV MOCK] Payment successful. Check My Orders.');
+    } catch (err) {
+      await ctx.reply(`❌ ${escapeHtml(err.message)}`);
+    }
+  });
+}
+
+async function handlePurchaseMessage() {
+  return false;
+}
+
+module.exports = {
+  registerPurchaseHandlers,
+  handlePurchaseMessage
+};

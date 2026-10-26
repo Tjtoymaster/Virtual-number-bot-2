@@ -1,0 +1,204 @@
+const { Markup } = require('telegraf');
+const config = require('../config');
+const database = require('../database/database');
+const orderService = require('../services/orderService');
+const { getState, setState, clearState } = require('../utils/state');
+const { parseUserAmountToKobo } = require('../utils/money');
+const { escapeHtml, formatMoney, shortId, formatOrderStatus } = require('../utils/format');
+const { chunk, editOrReply } = require('../utils/helpers');
+const { backMenuMarkup } = require('../utils/keyboards');
+
+const isAdmin = (ctx) => (config.admin.ids || []).includes(String(ctx.from?.id));
+
+async function replyHtml(ctx, text, markup) {
+  await ctx.reply(text, { parse_mode: 'HTML', ...(markup || {}) });
+}
+
+async function handleVerifyResult(ctx, orderId) {
+  const existing = database.getOrder(orderId);
+  if (!existing || (existing.userId !== String(ctx.from.id) && !isAdmin(ctx))) {
+    await ctx.reply('Order not found.');
+    return;
+  }
+
+  const res = await orderService.manualVerifyOrder(orderId);
+
+  if (!res.ok) {
+    await ctx.reply(
+      `❌ ${res.reason === 'api_error' ? `Could not check payment: ${escapeHtml(res.message || 'API error')}` : 'Could not check this order.'}`
+    );
+    return;
+  }
+
+  if (res.already) {
+    await replyHtml(
+      ctx,
+      `Order <code>${shortId(res.order.id)}</code> is already <b>${formatOrderStatus(res.order.status)}</b>.`
+    );
+    return;
+  }
+
+  if (res.verified === 'success') {
+    if (res.order.type === 'balance_topup') {
+      const user = database.getUser(res.order.userId);
+      await replyHtml(ctx, `✅ Payment confirmed!\n\nYour new balance: <b>${formatMoney(user?.balance || 0)}</b>`);
+    } else {
+      await replyHtml(
+        ctx,
+        `✅ Payment confirmed!\n\nOrder <code>${shortId(res.order.id)}</code> status: <b>${formatOrderStatus(res.order.status)}</b>\n\nOpen My Orders to see the number and OTP.`
+      );
+    }
+    return;
+  }
+
+  if (res.verified === 'failed') {
+    await replyHtml(ctx, `❌ Paystack reports this payment as failed or abandoned.\n\nOrder <code>${shortId(res.order.id)}</code> was closed.`);
+    return;
+  }
+
+  await replyHtml(ctx, `⏳ Paystack still shows this payment as pending.\n\nIf you already paid, wait ~30 seconds and tap "I have Paid" again.`);
+}
+
+async function startFunding(ctx, amountKobo) {
+  let order = null;
+
+  try {
+    const user = database.getUser(ctx.from.id);
+
+    order = orderService.createFundingOrder({
+      userId: user.id,
+      amountKobo
+    });
+
+    let checkoutUrl = null;
+    let paystackError = null;
+    try {
+      checkoutUrl = await orderService.initializePaystackPaymentForOrder(order, ctx);
+    } catch (err) {
+      paystackError = err.message;
+    }
+
+    clearState(ctx.from.id);
+
+    const text = [
+      '💳 <b>Balance Top-up</b>',
+      '',
+      `<b>Amount:</b> ${formatMoney(amountKobo, order.currency)}`,
+      `<b>Reference:</b> <code>${escapeHtml(order.paymentReference)}</code>`,
+      paystackError ? `\n⚠️ Paystack Error: ${escapeHtml(paystackError)}` : '',
+      '',
+      'Pay using the button, then tap "I have Paid" to confirm instantly.'
+    ].join('\n');
+
+    const buttons = [];
+    if (checkoutUrl) buttons.push([Markup.button.url('💳 Pay with Paystack', checkoutUrl)]);
+    buttons.push([Markup.button.callback('✅ I have Paid – Verify', `verify_fund:${order.id}`)]);
+    if (isAdmin(ctx)) buttons.push([Markup.button.callback('🛠️ [DEV] Simulate Success', `mock_fund:${order.id}`)]);
+    buttons.push([Markup.button.callback('🚫 Cancel', 'cancel_action')]);
+
+    await editOrReply(ctx, text, Markup.inlineKeyboard(buttons));
+  } catch (err) {
+    const buttons = [];
+    if (order) buttons.push([Markup.button.callback('✅ I have Paid – Verify', `verify_fund:${order.id}`)]);
+    if (isAdmin(ctx) && order) buttons.push([Markup.button.callback('🛠️ [DEV] Simulate Success', `mock_fund:${order.id}`)]);
+    buttons.push([Markup.button.callback('🚫 Cancel', 'cancel_action')]);
+
+    await ctx.reply(`❌ ${escapeHtml(err.message)}`, {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard(buttons)
+    });
+  }
+}
+
+function registerPaymentHandlers(bot) {
+  bot.action('fund_balance', async ctx => {
+    await ctx.answerCbQuery().catch(() => {});
+
+    setState(ctx.from.id, 'await_fund_amount');
+
+    const presets = [1000, 2000, 5000, 10000]
+      .map(amount => amount * 100)
+      .filter(kobo => kobo >= config.payments.minAmountKobo && kobo <= config.payments.maxAmountKobo);
+
+    const presetButtons = presets.map(kobo => Markup.button.callback(formatMoney(kobo), `fund_amt:${kobo}`));
+
+    const rows = chunk(presetButtons, 2);
+    rows.push([Markup.button.callback('✍️ Custom Amount', 'fund_custom')]);
+    rows.push([Markup.button.callback('🚫 Cancel', 'cancel_action')]);
+
+    await editOrReply(
+      ctx,
+      '💳 <b>Fund Balance</b>\n\nChoose an amount or send a custom amount in chat.',
+      Markup.inlineKeyboard(rows)
+    );
+  });
+
+  bot.action('fund_custom', async ctx => {
+    await ctx.answerCbQuery().catch(() => {});
+    setState(ctx.from.id, 'await_fund_amount');
+
+    await ctx.reply(
+      `Send the amount you want to add in ${config.payments.currency}.\n\nExample: 1500\n\nTo cancel, send /cancel`,
+      backMenuMarkup('🚫 Cancel')
+    );
+  });
+
+  bot.action(/^fund_amt:(\d+)$/, async ctx => {
+    await ctx.answerCbQuery().catch(() => {});
+
+    const amountKobo = Number(ctx.match[1]);
+
+    if (
+      !Number.isInteger(amountKobo) ||
+      amountKobo < config.payments.minAmountKobo ||
+      amountKobo > config.payments.maxAmountKobo
+    ) {
+      await ctx.reply('Invalid funding amount.', backMenuMarkup());
+      return;
+    }
+
+    await startFunding(ctx, amountKobo);
+  });
+
+  bot.action(/^verify_fund:(.+)$/, async ctx => {
+    await ctx.answerCbQuery('Checking with Paystack...').catch(() => {});
+    await handleVerifyResult(ctx, ctx.match[1]);
+  });
+
+  bot.action(/^mock_fund:(.+)$/, async ctx => {
+    if (!isAdmin(ctx)) {
+      return ctx.answerCbQuery('⛔ Admin only.', { show_alert: true });
+    }
+    await ctx.answerCbQuery('Simulating payment...').catch(() => {});
+    try {
+      await orderService.mockPayOrder(ctx.match[1]);
+    } catch (err) {
+      await ctx.reply(`❌ ${escapeHtml(err.message)}`);
+    }
+  });
+}
+
+async function handlePaymentMessage(ctx) {
+  const state = getState(ctx.from.id);
+
+  if (!state || state.type !== 'await_fund_amount') {
+    return false;
+  }
+
+  const text = ctx.message?.text?.trim();
+  if (!text) return false;
+
+  try {
+    const amountKobo = parseUserAmountToKobo(text);
+    await startFunding(ctx, amountKobo);
+  } catch (err) {
+    await ctx.reply(`❌ ${escapeHtml(err.message)}\n\nSend a valid amount or /cancel.`, backMenuMarkup());
+  }
+
+  return true;
+}
+
+module.exports = {
+  registerPaymentHandlers,
+  handlePaymentMessage
+};
