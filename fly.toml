@@ -1,9 +1,9 @@
-# fly.toml app configuration file generated for say110tjj on 2026-10-26T07:41:11Z
+# fly.toml app configuration file generated for kingtj on 2026-10-26T07:48:42Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'say110tjj'
+app = 'kingtj'
 primary_region = 'ams'
 
 [build]
