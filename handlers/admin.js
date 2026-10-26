@@ -1,0 +1,233 @@
+const { Markup } = require("telegraf");
+
+function registerAdmin(bot, database, config) {
+  const adminIds = (config?.adminIds && config.adminIds.length
+    ? config.adminIds
+    : [config?.adminId]
+  ).map(String).filter(Boolean);
+
+  if (!adminIds.length) {
+    console.warn("[admin] ADMIN_ID is not configured. Admin commands will be disabled.");
+  }
+
+  const isAdmin = (ctx) => adminIds.includes(String(ctx.from?.id));
+
+  // Balances are stored in KOBO. Admin commands accept NGN and convert.
+  const toKobo = (ngn) => Math.round(Number(ngn) * 100);
+  const formatNgn = (kobo) => `₦${(Number(kobo || 0) / 100).toFixed(2)}`;
+
+  bot.command("admin", async (ctx) => {
+    if (!isAdmin(ctx)) {
+      return ctx.reply("⛔ You are not authorized to access this panel.");
+    }
+
+    await ctx.reply(
+      "🛡️ ADMIN CONTROL PANEL\n\n" +
+        "Welcome, Administrator!\n\n" +
+        "Choose an action below.",
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback("📊 Statistics", "admin_stats"),
+          Markup.button.callback("👥 Users", "admin_users")
+        ],
+        [
+          Markup.button.callback("🔎 Find User", "admin_find_help"),
+          Markup.button.callback("📢 Broadcast", "admin_broadcast_help")
+        ],
+        [Markup.button.callback("💰 Balance Help", "admin_balance_help")]
+      ])
+    );
+  });
+
+  bot.action(/^admin_/, async (ctx, next) => {
+    if (!isAdmin(ctx)) {
+      return ctx.answerCbQuery("⛔ Admin access only.", { show_alert: true });
+    }
+    return next();
+  });
+
+  bot.action("admin_stats", async (ctx) => {
+    await ctx.answerCbQuery();
+
+    const db = database.getDatabase();
+    const users = Object.values(db.users || {});
+    const orders = Object.values(db.orders || {});
+
+    const totalBalanceKobo = users.reduce((sum, user) => sum + Number(user.balance || 0), 0);
+
+    await ctx.reply(
+      "📊 BOT STATISTICS\n\n" +
+        `👥 Registered users: ${users.length}\n` +
+        `📦 Recorded orders: ${orders.length}\n` +
+        `💰 Combined balances: ${formatNgn(totalBalanceKobo)}`
+    );
+  });
+
+  bot.action("admin_users", async (ctx) => {
+    await ctx.answerCbQuery();
+
+    const users = database.getAllUsers();
+
+    await ctx.reply(
+      "👥 USER STATISTICS\n\n" +
+        `Total registered users: ${users.length}\n\n` +
+        "Use /finduser TELEGRAM_ID to inspect a specific user."
+    );
+  });
+
+  bot.action("admin_find_help", async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.reply(
+      "🔎 FIND A USER\n\n" + "Command:\n/finduser TELEGRAM_ID\n\nExample:\n/finduser 123456789"
+    );
+  });
+
+  bot.action("admin_broadcast_help", async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.reply(
+      "📢 BROADCAST MESSAGE\n\n" +
+        "Command:\n/broadcast Your announcement here\n\n" +
+        "The message will be sent to registered users."
+    );
+  });
+
+  bot.action("admin_balance_help", async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.reply(
+      "💰 TEST BALANCE MANAGEMENT\n\n" +
+        "Add:\n/balanceadd TELEGRAM_ID AMOUNT\n\n" +
+        "Deduct:\n/balancededuct TELEGRAM_ID AMOUNT\n\n" +
+        "Amount is entered in NGN (e.g. 5000 = ₦5,000).\n" +
+        "These commands modify test balances only.\n" +
+        "They do not represent actual payments."
+    );
+  });
+
+  bot.command("finduser", async (ctx) => {
+    if (!isAdmin(ctx)) {
+      return ctx.reply("⛔ Admin access only.");
+    }
+
+    const id = ctx.message.text.trim().split(/\s+/)[1];
+
+    if (!id || !/^\d+$/.test(id)) {
+      return ctx.reply("Usage: /finduser TELEGRAM_ID");
+    }
+
+    const user = database.getUser(id);
+
+    if (!user) {
+      return ctx.reply("❌ User not found in the database.");
+    }
+
+    await ctx.reply(
+      "👤 USER DETAILS\n\n" +
+        `Name: ${user.firstName || "User"}\n` +
+        `Username: ${user.username ? "@" + user.username : "Not set"}\n` +
+        `Telegram ID: ${user.id}\n` +
+        `Balance: ${formatNgn(user.balance)}\n` +
+        `Orders: ${(user.orders || []).length}\n` +
+        `Registered: ${user.createdAt || user.joinedAt || "Unknown"}`
+    );
+  });
+
+  bot.command("balanceadd", async (ctx) => {
+    if (!isAdmin(ctx)) {
+      return ctx.reply("⛔ Admin access only.");
+    }
+
+    const args = ctx.message.text.trim().split(/\s+/);
+    const id = args[1];
+    const amount = Number(args[2]);
+
+    if (!id || !/^\d+$/.test(id) || !Number.isFinite(amount) || amount <= 0 || amount > 1000000) {
+      return ctx.reply("Usage: /balanceadd TELEGRAM_ID AMOUNT\n\nAmount is in NGN. Example: /balanceadd 123456 5000");
+    }
+
+    const user = database.getUser(id);
+
+    if (!user) {
+      return ctx.reply("❌ User not found.");
+    }
+
+    try {
+      const updated = database.addBalance(id, toKobo(amount), "Admin test balance add");
+
+      await ctx.reply(
+        "✅ TEST BALANCE UPDATED\n\n" +
+          `User: ${id}\n` +
+          `Added: ₦${amount.toFixed(2)}\n` +
+          `New balance: ${formatNgn(updated.balance)}`
+      );
+    } catch (err) {
+      await ctx.reply(`❌ ${err.message}`);
+    }
+  });
+
+  bot.command("balancededuct", async (ctx) => {
+    if (!isAdmin(ctx)) {
+      return ctx.reply("⛔ Admin access only.");
+    }
+
+    const args = ctx.message.text.trim().split(/\s+/);
+    const id = args[1];
+    const amount = Number(args[2]);
+
+    if (!id || !/^\d+$/.test(id) || !Number.isFinite(amount) || amount <= 0 || amount > 1000000) {
+      return ctx.reply("Usage: /balancededuct TELEGRAM_ID AMOUNT\n\nAmount is in NGN. Example: /balancededuct 123456 500");
+    }
+
+    const user = database.getUser(id);
+
+    if (!user) {
+      return ctx.reply("❌ User not found.");
+    }
+
+    try {
+      const updated = database.deductBalance(id, toKobo(amount), "Admin test balance deduct");
+
+      await ctx.reply(
+        "✅ TEST BALANCE DEDUCTED\n\n" +
+          `User: ${id}\n` +
+          `Deducted: ₦${amount.toFixed(2)}\n` +
+          `New balance: ${formatNgn(updated.balance)}`
+      );
+    } catch (err) {
+      await ctx.reply(`❌ ${err.message}`);
+    }
+  });
+
+  bot.command("broadcast", async (ctx) => {
+    if (!isAdmin(ctx)) {
+      return ctx.reply("⛔ Admin access only.");
+    }
+
+    const message = ctx.message.text.replace(/^\/broadcast(?:@\w+)?\s*/i, "").trim();
+
+    if (!message) {
+      return ctx.reply("Usage: /broadcast Your announcement here");
+    }
+
+    const users = database.getAllUsers();
+
+    await ctx.reply(`📢 Broadcast started for ${users.length} registered users.`);
+
+    let sent = 0;
+    let failed = 0;
+
+    for (const user of users) {
+      try {
+        await ctx.telegram.sendMessage(user.id, message);
+        sent++;
+      } catch (error) {
+        failed++;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+
+    await ctx.reply("📢 BROADCAST FINISHED\n\n" + `✅ Sent: ${sent}\n` + `❌ Failed: ${failed}`);
+  });
+}
+
+module.exports = registerAdmin;
