@@ -1,0 +1,527 @@
+const crypto = require('crypto');
+const config = require('../config');
+const database = require('../database/database');
+const paystack = require('./paystack');
+const dssmshub = require('./dssmshub');
+const notifier = require('./notifier');
+const logger = require('../utils/logger');
+const { providerPriceToKobo } = require('../utils/money');
+const { escapeHtml, formatMoney, shortId } = require('../utils/format');
+
+const locks = new Set();
+
+async function withOrderLock(orderId, fn) {
+  if (locks.has(orderId)) return;
+
+  locks.add(orderId);
+  try {
+    return await fn();
+  } finally {
+    locks.delete(orderId);
+  }
+}
+
+function generateReference(prefix) {
+  return `${prefix}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+}
+
+function createFundingOrder({ userId, amountKobo }) {
+  const amount = Math.trunc(Number(amountKobo));
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error('Invalid funding amount');
+  }
+
+  return database.createOrder({
+    userId,
+    type: 'balance_topup',
+    status: 'pending_payment',
+    amountKobo: amount,
+    currency: config.payments.currency,
+    paymentMethod: 'paystack',
+    paymentReference: generateReference('fund'),
+    metadata: {
+      source: 'fund_balance'
+    }
+  });
+}
+
+function createNumberOrder({ userId, serverId, country, service, chargeKobo }) {
+  const amount = Number.isFinite(Number(chargeKobo))
+    ? Math.trunc(Number(chargeKobo))
+    : providerPriceToKobo(service.price, service.currency);
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error('Provider price is unavailable or invalid');
+  }
+
+  return database.createOrder({
+    userId,
+    type: 'number_purchase',
+    status: 'pending_payment',
+    amountKobo: amount,
+    currency: config.payments.currency,
+    paymentReference: generateReference('num'),
+    server: serverId,
+    country: {
+      code: country.code,
+      name: country.name
+    },
+    service: {
+      id: service.id,
+      name: service.name
+    },
+    metadata: {}
+  });
+}
+
+async function initializePaystackPaymentForOrder(order, ctx = null) {
+  if (!order) throw new Error('Order not found');
+  if (order.amountKobo <= 0) throw new Error('Order amount must be greater than zero');
+
+  const email = `user${order.userId}@paystacktest.com`;
+  const customerName = ctx?.from?.username ? `@${ctx.from.username}` : `User ${order.userId}`;
+
+  const description =
+    order.type === 'balance_topup'
+      ? `Fund balance ${formatMoney(order.amountKobo, order.currency)}`
+      : `Buy ${order.service?.name || 'virtual number'}`;
+
+  const { checkoutUrl } = await paystack.initializePayment({
+    amountKobo: order.amountKobo,
+    currency: order.currency,
+    reference: order.paymentReference,
+    email,
+    customerName,
+    description
+  });
+
+  database.updateOrder(order.id, {
+    paymentMethod: 'paystack',
+    metadata: {
+      checkoutUrl
+    }
+  });
+
+  return checkoutUrl;
+}
+
+async function failOrderWithRefund(orderId, reason) {
+  const order = database.getOrder(orderId);
+  if (!order || ['failed', 'completed'].includes(order.status)) return;
+
+  const wasPaid =
+    Boolean(order.paidAt) ||
+    (['balance', 'paystack'].includes(order.paymentMethod) &&
+      ['paid', 'waiting_sms', 'provisioning'].includes(order.status));
+
+  let refunded = false;
+
+  if (wasPaid && order.amountKobo > 0 && !order.refunded) {
+    database.addBalance(order.userId, order.amountKobo, `Refund for order ${shortId(order.id)}`);
+    refunded = true;
+  }
+
+  database.updateOrder(order.id, {
+    status: 'failed',
+    error: reason,
+    refunded,
+    failedAt: new Date().toISOString(),
+    metadata: {
+      failureReason: reason
+    }
+  });
+
+  const text = refunded
+    ? ` Order <code>${shortId(order.id)}</code> failed: ${escapeHtml(reason)}\n\nYour payment has been refunded to your bot balance.`
+    : `❌ Order <code>${shortId(order.id)}</code> failed: ${escapeHtml(reason)}`;
+
+  await notifier.notifyUser(order.userId, text);
+}
+
+async function provisionOrder(orderId) {
+  return withOrderLock(orderId, async () => {
+    const order = database.getOrder(orderId);
+    if (!order || order.type !== 'number_purchase') return;
+    if (order.status !== 'paid') return;
+
+    if (!order.server || !order.country?.code || !order.service?.id) {
+      await failOrderWithRefund(order.id, 'Order is missing server, country or service details');
+      return;
+    }
+
+    try {
+      const purchase = await dssmshub.buyNumber({
+        serverId: order.server,
+        serviceId: order.service.id,
+        countryCode: order.country.code,
+        serviceName: order.service.name,
+        orderId: order.id
+      });
+
+      database.updateOrder(order.id, {
+        providerOrderId: purchase.providerOrderId,
+        phoneNumber: purchase.phoneNumber,
+        status: 'waiting_sms',
+        metadata: {
+          providerPurchase: purchase.raw
+        }
+      });
+
+      await notifier.notifyUser(
+        order.userId,
+        `📱 Your virtual number is ready.\n\nNumber: <code>${escapeHtml(purchase.phoneNumber || 'N/A')}</code>\n\nWaiting for SMS/OTP...`
+      );
+    } catch (err) {
+      logger.error(`Failed to provision order ${orderId}:`, err);
+      await failOrderWithRefund(orderId, err.message || 'Number provisioning failed');
+    }
+  });
+}
+
+async function refreshOrderStatus(orderId, { notify = true } = {}) {
+  return withOrderLock(orderId, async () => {
+    const order = database.getOrder(orderId);
+    if (!order) throw new Error('Order not found');
+
+    if (order.status === 'completed') return order;
+    if (!order.providerOrderId) return order;
+
+    let status;
+
+    try {
+      status = await dssmshub.getOrderStatus(order.providerOrderId);
+    } catch (err) {
+      logger.warn(`Failed to refresh DSSMSHub status for order ${orderId}:`, err.message);
+      return order;
+    }
+
+    if (status.status === 'failed') {
+      await failOrderWithRefund(order.id, 'Provider reported failure for this number');
+      return database.getOrder(orderId);
+    }
+
+    const hasOtp = Boolean(status.otp || status.smsText);
+
+    if (hasOtp) {
+      database.updateOrder(order.id, {
+        status: 'completed',
+        otp: status.otp || null,
+        smsText: status.smsText || null,
+        phoneNumber: status.phoneNumber || order.phoneNumber,
+        completedAt: new Date().toISOString(),
+        metadata: {
+          providerStatus: status.raw
+        }
+      });
+
+      if (notify) {
+        const visibleCode = status.otp || String(status.smsText || '').slice(0, 3500);
+
+        await notifier.notifyUser(
+          order.userId,
+          `✅ OTP/SMS received for order <code>${shortId(order.id)}</code>.\n\n<code>${escapeHtml(visibleCode)}</code>`
+        );
+      }
+
+      return database.getOrder(orderId);
+    }
+
+    database.updateOrder(order.id, {
+      phoneNumber: status.phoneNumber || order.phoneNumber,
+      metadata: {
+        providerStatus: status.raw,
+        lastSmsCheckAt: new Date().toISOString()
+      }
+    });
+
+    return database.getOrder(orderId);
+  });
+}
+
+async function payOrderWithBalance(orderId) {
+  const order = database.getOrder(orderId);
+  if (!order) throw new Error('Order not found');
+  if (order.status !== 'pending_payment') {
+    throw new Error('Order is not pending payment');
+  }
+
+  database.deductBalance(order.userId, order.amountKobo, `Payment for order ${shortId(order.id)}`);
+
+  database.updateOrder(order.id, {
+    status: 'paid',
+    paymentMethod: 'balance'
+  });
+
+  await provisionOrder(order.id);
+  return database.getOrder(order.id);
+}
+
+async function completePaymentByReference(reference, payload) {
+  const order = database.getOrderByPaymentReference(reference);
+
+  if (!order) {
+    return { ignored: true, reason: 'order_not_found' };
+  }
+
+  if (order.status !== 'pending_payment') {
+    return { ignored: true, reason: 'duplicate_or_not_pending' };
+  }
+
+  if (payload.status !== 'success') {
+    database.updateOrder(order.id, {
+      status: 'failed',
+      error: 'Payment gateway reported failure',
+      metadata: { webhook: payload.raw }
+    });
+
+    return { success: false, order: database.getOrder(order.id) };
+  }
+
+  const expectedAmount = Number(order.amountKobo);
+  const receivedAmount = Number(payload.amount);
+  const receivedCurrency = String(payload.currency || order.currency).toUpperCase();
+
+  let verifiedByApi = false;
+
+  if (config.paystack.verifyWithApi) {
+    try {
+      const verification = await paystack.verifyPayment(reference);
+
+      if (verification.status !== 'success') {
+        database.updateOrder(order.id, {
+          status: 'failed',
+          error: 'Payment API verification failed',
+          metadata: { webhook: payload.raw, verification: verification.raw }
+        });
+
+        return { success: false, order: database.getOrder(order.id) };
+      }
+
+      if (Number.isFinite(Number(verification.amount)) && Number(verification.amount) !== expectedAmount) {
+        database.updateOrder(order.id, {
+          status: 'failed',
+          error: 'Payment API amount mismatch',
+          metadata: { webhook: payload.raw, verification: verification.raw }
+        });
+
+        return { success: false, order: database.getOrder(order.id) };
+      }
+
+      verifiedByApi = true;
+    } catch (err) {
+      logger.warn(`Paystack API verification failed for ${reference}:`, err.message);
+    }
+  }
+
+  if (!verifiedByApi) {
+    const hasAmount = Number.isFinite(receivedAmount) && receivedAmount > 0;
+
+    if (!hasAmount) {
+      database.updateOrder(order.id, {
+        status: 'failed',
+        error: 'Webhook did not include a valid amount',
+        metadata: { webhook: payload.raw }
+      });
+
+      return { success: false, order: database.getOrder(order.id) };
+    }
+
+    if (receivedAmount !== expectedAmount) {
+      database.updateOrder(order.id, {
+        status: 'failed',
+        error: 'Payment amount mismatch',
+        metadata: { webhook: payload.raw }
+      });
+
+      return { success: false, order: database.getOrder(order.id) };
+    }
+  }
+
+  if (payload.currency && receivedCurrency !== String(order.currency).toUpperCase()) {
+    database.updateOrder(order.id, {
+      status: 'failed',
+      error: 'Payment currency mismatch',
+      metadata: { webhook: payload.raw }
+    });
+
+    return { success: false, order: database.getOrder(order.id) };
+  }
+
+  database.updateOrder(order.id, {
+    status: 'paid',
+    paymentMethod: 'paystack',
+    metadata: { webhook: payload.raw }
+  });
+
+  const paidOrder = database.getOrder(order.id);
+
+  if (paidOrder.type === 'balance_topup') {
+    database.addBalance(paidOrder.userId, paidOrder.amountKobo, `Funding order ${shortId(paidOrder.id)}`);
+
+    await notifier.notifyUser(
+      paidOrder.userId,
+      `✅ Payment received.\n\nYour balance was credited with <b>${formatMoney(paidOrder.amountKobo, paidOrder.currency)}</b>.`
+    );
+  } else {
+    await notifier.notifyUser(
+      paidOrder.userId,
+      `✅ Payment received for order <code>${shortId(paidOrder.id)}</code>.\n\nProcessing your virtual number...`
+    );
+
+    await provisionOrder(paidOrder.id);
+  }
+
+  return { success: true, order: database.getOrder(order.id) };
+}
+
+function findOrderByProviderOrderId(providerOrderId) {
+  const orders = database.getDatabase().orders || {};
+  return (
+    Object.values(orders).find(order => String(order.providerOrderId) === String(providerOrderId)) ||
+    null
+  );
+}
+
+async function handleProviderOtpWebhook(payload) {
+  const providerOrderId = String(payload.order_id ?? payload.orderId ?? '');
+
+  if (!providerOrderId) {
+    return { ignored: true, reason: 'missing_order_id' };
+  }
+
+  const order = findOrderByProviderOrderId(providerOrderId);
+
+  if (!order) {
+    return { ignored: true, reason: 'order_not_found' };
+  }
+
+  if (order.status === 'completed') {
+    return { ignored: true, reason: 'already_completed' };
+  }
+
+  const otp = payload.sms_code ?? payload.code ?? null;
+  const smsText = payload.sms_text ?? payload.full_sms ?? (otp ? `Your code is ${otp}` : '');
+
+  database.updateOrder(order.id, {
+    status: 'completed',
+    otp: otp ? String(otp) : null,
+    smsText: smsText ? String(smsText) : null,
+    phoneNumber: payload.number ? String(payload.number) : order.phoneNumber,
+    completedAt: new Date().toISOString(),
+    metadata: { providerWebhook: payload }
+  });
+
+  const visibleCode = otp || String(smsText).slice(0, 3500);
+
+  await notifier.notifyUser(
+    order.userId,
+    `✅ OTP received for order <code>${shortId(order.id)}</code>.\n\nNumber: <code>${escapeHtml(payload.number || order.phoneNumber || 'N/A')}</code>\nCode: <code>${escapeHtml(visibleCode)}</code>`
+  );
+
+  return { success: true, orderId: order.id };
+}
+
+async function mockPayOrder(orderId) {
+  const order = database.getOrder(orderId);
+  if (!order) throw new Error('Order not found');
+  if (order.status !== 'pending_payment') {
+    throw new Error('Order is not pending payment');
+  }
+
+  database.updateOrder(order.id, {
+    status: 'paid',
+    paymentMethod: 'mock_dev',
+    metadata: { ...(order.metadata || {}), mockPayment: true }
+  });
+
+  const paidOrder = database.getOrder(order.id);
+
+  if (paidOrder.type === 'balance_topup') {
+    database.addBalance(
+      paidOrder.userId,
+      paidOrder.amountKobo,
+      `MOCK DEV: Funding order ${shortId(paidOrder.id)}`
+    );
+
+    await notifier.notifyUser(
+      paidOrder.userId,
+      `✅ [DEV MOCK] Payment simulated.\n\nYour balance was credited with <b>${formatMoney(paidOrder.amountKobo, paidOrder.currency)}</b>.`
+    );
+  } else {
+    await notifier.notifyUser(
+      paidOrder.userId,
+      `✅ [DEV MOCK] Payment simulated for order <code>${shortId(paidOrder.id)}</code>.\n\nProcessing your virtual number...`
+    );
+
+    await provisionOrder(paidOrder.id);
+  }
+
+  return database.getOrder(order.id);
+}
+
+async function processActiveOrder(orderId) {
+  const order = database.getOrder(orderId);
+  if (!order || order.type !== 'number_purchase') return;
+
+  if (order.status === 'paid') {
+    return provisionOrder(orderId);
+  }
+
+  if (order.status === 'waiting_sms') {
+    return refreshOrderStatus(orderId, { notify: true });
+  }
+}
+
+async function manualVerifyOrder(orderId) {
+  const order = database.getOrder(orderId);
+  if (!order) return { ok: false, reason: 'not_found' };
+  if (order.status !== 'pending_payment') return { ok: true, already: true, order };
+  if (!order.paymentReference) return { ok: false, reason: 'no_reference' };
+
+  let verification;
+  try {
+    verification = await paystack.verifyPayment(order.paymentReference);
+  } catch (err) {
+    return { ok: false, reason: 'api_error', message: err.message };
+  }
+
+  if (verification.status === 'success') {
+    await completePaymentByReference(order.paymentReference, {
+      event: 'payment.manual_verify',
+      reference: order.paymentReference,
+      status: 'success',
+      amount: Number(verification.amount) || Number(order.amountKobo),
+      currency: verification.currency || order.currency,
+      raw: verification.raw
+    });
+    return { ok: true, verified: 'success', order: database.getOrder(orderId) };
+  }
+
+  if (verification.status === 'failed') {
+    await completePaymentByReference(order.paymentReference, {
+      event: 'payment.manual_verify',
+      reference: order.paymentReference,
+      status: 'failed',
+      amount: 0,
+      raw: verification.raw
+    });
+    return { ok: true, verified: 'failed', order: database.getOrder(orderId) };
+  }
+
+  return { ok: true, verified: 'pending', order };
+}
+
+module.exports = {
+  createFundingOrder,
+  createNumberOrder,
+  initializePaystackPaymentForOrder,
+  payOrderWithBalance,
+  completePaymentByReference,
+  provisionOrder,
+  refreshOrderStatus,
+  processActiveOrder,
+  handleProviderOtpWebhook,
+  mockPayOrder,
+  manualVerifyOrder
+};
